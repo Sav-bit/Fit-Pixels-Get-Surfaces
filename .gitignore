@@ -192,3 +192,9 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+#oasis dataset
+neurite-oasis.v1.0.tar
+*.nii.gz
+seg*.txt
+subjects.txt
