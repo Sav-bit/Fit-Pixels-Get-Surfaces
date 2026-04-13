@@ -1,43 +1,26 @@
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
-import torch
-torch.manual_seed(422)
-
-import os, os.path as osp
-import sys
-
-import numpy as np
 import glob
+import json
+import os.path as osp
+import sys
+from copy import deepcopy
+
+import alpine
+import dataloaders
 import matplotlib.pyplot as plt
 import torch
-from copy import deepcopy
 import torch.nn as nn
-
+torch.manual_seed(422)
 import numpy as np
-import os, os.path as osp
-import torch
-import alpine
-from matplotlib import pyplot as plt
-
 from tqdm.autonotebook import tqdm
 
-import sys
-sys.path.append('../../modules')
-sys.path.append("../../")
-from learner import INRMetaLearner
-import dataloaders
-
-import models
-import loss_functions
-import metrics
-import utils
-import vis
-
-import json
+from modules import loss_functions, metrics, models, utils, vis
+from modules.learner import INRMetaLearner
 
 dataset_dir = "/projects/thesis-saverio/data"
-config_file = "../../config/oasis_splits_3d.json"
+config_file = "./config/oasis_splits_3d.json"
 
 
 SCRIPT_DIR = osp.dirname(osp.abspath(__file__))
