@@ -195,6 +195,7 @@ cython_debug/
 
 #oasis dataset
 neurite-oasis.v1.0.tar
+*.nii
 *.nii.gz
 seg*.txt
 subjects.txt
