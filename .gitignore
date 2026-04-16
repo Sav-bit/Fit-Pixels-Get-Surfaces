@@ -199,3 +199,6 @@ neurite-oasis.v1.0.tar
 *.nii.gz
 seg*.txt
 subjects.txt
+
+#My directories of test data
+test*/*
