@@ -13,17 +13,6 @@ SYNTHSEG_KEEP_LABELS = [
     47, 48, 49, 50, 51, 52, 53, 54, 55, 56
 ]
 
-def parse_bool(value: str) -> bool:
-    value = value.strip().lower()
-    if value in {"true", "t", "1", "yes", "y"}:
-        return True
-    if value in {"false", "f", "0", "no", "n"}:
-        return False
-    raise argparse.ArgumentTypeError(
-        "SAVE_DEBUG must be a boolean value like true/false or 1/0"
-    )
-
-
 def stripped_output_path(t1_path: str) -> Path:
     input_path = Path(t1_path)
     base_name = input_path.name
@@ -44,9 +33,10 @@ def main() -> int:
     parser.add_argument("t1_path", help="Path to the input nii/nii.gz image")
     parser.add_argument("seg_path", help="Path to the SynthSeg segmentation image")
     parser.add_argument(
-        "SAVE_DEBUG",
-        type=parse_bool,
-        help="Whether to save the debug labels image (true/false)",
+        "--save-debug",
+        dest="save_debug",
+        action="store_true",
+        help="If present, save the debug labels image",
     )
     args = parser.parse_args()
 
@@ -68,7 +58,7 @@ def main() -> int:
 
     nib.save(stripped_img, str(stripped_output_path(args.t1_path)))
 
-    if args.SAVE_DEBUG:
+    if args.save_debug:
         debug_seg = np.where(mask_orig, seg, 0).astype(np.int16)
         nib.save(
             nib.Nifti1Image(debug_seg, seg_img.affine, seg_img.header),
