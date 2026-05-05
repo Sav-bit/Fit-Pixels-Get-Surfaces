@@ -40,7 +40,9 @@ dataset_dir = "/projects/thesis-saverio/data"
 config_file = "../../config/oasis_splits_3d.json"
 
 
-weights_file = "./dumps/weights3d_num_classes_4_IS_2.pth"
+SCRIPT_DIR = osp.dirname(osp.abspath(__file__))
+weights_file = osp.join(SCRIPT_DIR, "dumps", "weights3d_num_classes_4_IS_2.pth")
+CLASSIFIER_WEIGHTS_DIR = osp.join(SCRIPT_DIR, "dumps", "weights_3d")
 
 SAVE_FEATURE_VECS = False
 USE_SAVED_FEATURE_VECS_TO_TRAIN_CLF = not SAVE_FEATURE_VECS
@@ -153,7 +155,7 @@ if SAVE_FEATURE_VECS:
 
     pbar_val = tqdm(enumerate(val_dl), total=len(val_dl), position=0)
     for val_ix, val_data in pbar_val:
-        _tmp_save_check =  osp.join(SAVE_PATHS,"val" , f"val_{train_ix}.pth")
+        _tmp_save_check =  osp.join(SAVE_PATHS,"val" , f"val_{val_ix}.pth")
         if osp.isfile(_tmp_save_check):
             continue
         
@@ -303,8 +305,9 @@ if USE_SAVED_FEATURE_VECS_TO_TRAIN_CLF:
                     best_val_score = avg_val_loss
                     final_classifier_weights = deepcopy(classifier_model.state_dict())
                     tqdm.write(f'updated best val score to {best_val_score}')
+                    os.makedirs(CLASSIFIER_WEIGHTS_DIR, exist_ok=True)
                     torch.save({'final_clf_weights':final_classifier_weights, 'focal_loss_gamma':FOCAL_LOSS_GAMMA, 'zero_wt':ZERO_WT}, 
-                            f"./dumps/weights_3d/classifierfinal_weights_LR_{LEARNING_RATE}_exp_{EXPERIMENT_NAME}.pth")
+                        osp.join(CLASSIFIER_WEIGHTS_DIR, f"classifierfinal_weights_LR_{LEARNING_RATE}_exp_{EXPERIMENT_NAME}.pth"))
 
 
 
