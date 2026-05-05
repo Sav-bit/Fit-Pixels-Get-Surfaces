@@ -7,13 +7,12 @@ import nibabel as nib
 import json
 import os, os.path as osp
 
-import libINR.utils.coords
 import torch.nn.functional as F
 
 
 
 class TorchMRI3D_Dataloader(torch.utils.data.Dataset):
-    def __init__(self, json_file, mode='train', num_classes=4, resolution=None, transforms=None, config={}, coords=None, skip_pixels=1.0):
+    def __init__(self, json_file, mode='train', num_classes=4, resolution=None, transforms=None, config={}, coords=None, skip_pixels=1.0, dataset_dir=None):
         super(TorchMRI3D_Dataloader, self).__init__()
         assert num_classes == 4 or num_classes == 24 or num_classes == 35, "Only 4 or 24 classes are supported"
         self.json_file = json_file
@@ -24,6 +23,7 @@ class TorchMRI3D_Dataloader(torch.utils.data.Dataset):
         self.transforms = transforms
         self.num_classes = num_classes
         self.skip_pixels = skip_pixels
+        self.dataset_dir = dataset_dir
         self.build()
 
     def build(self):
@@ -93,6 +93,10 @@ class TorchMRI3D_Dataloader(torch.utils.data.Dataset):
         vol_path = data_dict['img'] # key is img. but its actually volume
         seg_path = data_dict[f'seg{self.num_classes}'] 
 
+        if self.dataset_dir is not None:
+            vol_path = osp.join(self.dataset_dir, vol_path)
+            seg_path = osp.join(self.dataset_dir, seg_path)
+
         volume = self.read_nib_volume(vol_path)
         segmentation_integers = self.read_nib_volume(seg_path)
         coords = self.coords.clone()
@@ -136,7 +140,7 @@ class CLFFeature(torch.utils.data.Dataset):
     
     def __getitem__(self, idx):
         st = time.time()
-        data = torch.load(self.all_files[idx])
+        data = torch.load(self.all_files[idx], weights_only=False)
         et = time.time()
         # print('time to load = ' ,et-st)
 
