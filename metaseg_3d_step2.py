@@ -6,13 +6,12 @@ from copy import deepcopy
 import alpine
 import torch
 import torch.nn as nn
-
-import dataloaders
-
-torch.manual_seed(422)
 from tqdm.autonotebook import tqdm
 
+import dataloaders
 from modules import loss_functions, models
+
+torch.manual_seed(422)
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 dataset_dir = "/projects/thesis-saverio/data"
