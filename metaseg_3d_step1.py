@@ -2,11 +2,8 @@
 
 # ## MetaSeg 3D segmentation STEP 1
 
+import json
 import os
-
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-
-import sys
 from copy import deepcopy
 from pathlib import Path
 
@@ -15,40 +12,26 @@ import torch
 import torch.nn as nn
 from tqdm.autonotebook import tqdm
 
-torch.manual_seed(422)
-
-# ensure repo root on path for local imports
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-import json
-
-# In[6]:
-import nibabel as nib
-
 import dataloaders
 from modules import loss_functions, metrics, models
 from modules.learner import INRMetaLearner
 
-img = nib.load("/scratch/thesis-saverio/data/HCP/sub-001/t1w.nii.gz").get_fdata()
-print(img.shape)
+torch.manual_seed(422)
 
-img_2 = nib.load("/scratch/thesis-saverio/data/HCP/sub-002/t1w.nii.gz").get_fdata()
-print(img_2.shape)
 
-img_3 = nib.load(
-    "/projects/thesis-saverio/data/OASIS_OAS1_0001_MR1/aligned_norm.nii.gz"
-).get_fdata()
-print(img_3.shape)
+# In[6]:
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+
 # In[7]:
 
-OUTPUT_DIR = Path(__file__).resolve().parent / "dumps"
+OUTPUT_DIR = Path("/scratch/thesis-saverio/dumps/metaseg_3d_step1-normalized")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-dataset_dir = "/projects/thesis-saverio/data"
-config_file = str(REPO_ROOT / "config" / "oasis_splits_3d.json")
+dataset_dir = "/scratch/thesis-saverio/data/HCP"
+config_file = "config/HCP_split.json"
 
 
 # In[9]:
@@ -89,10 +72,6 @@ VAL_META_STEPS = 100
 OUTER_LOOP_ITERATIONS = 5000  # 5000
 NUM_CLASSES = 4
 NUM_CLASSES_AND_ONE = NUM_CLASSES + 1
-# RES = (160, 192, 224)
-
-RES = (160, 160, 200)
-VAL_RES = RES = [160 // SKIP_PIXELS, 160 // SKIP_PIXELS, 200 // SKIP_PIXELS]
 
 NORMALIZE_FEATURES = False
 
@@ -147,6 +126,7 @@ meta_learner = INRMetaLearner(
     ),
     outer_optimizer="adam",
     inner_loop_loss_fn=None,  # uses default loss fn.
+    first_order=True,
 )
 
 
@@ -167,8 +147,7 @@ NUM_VAL_EXAMPLES = 100
 train_ds = dataloaders.TorchMRI3D_Dataloader(
     json_file=config_file,
     mode="train",
-    resolution=RES,
-    config={"augment": RANDOM_AUGMENT},
+    config={"augment": RANDOM_AUGMENT, "normalize": True},
     num_classes=NUM_CLASSES,
     skip_pixels=SKIP_PIXELS,
     dataset_dir=dataset_dir,
@@ -176,8 +155,11 @@ train_ds = dataloaders.TorchMRI3D_Dataloader(
 val_ds = dataloaders.TorchMRI3D_Dataloader(
     json_file=config_file,
     mode="val",
-    resolution=RES,
-    config={"augment": RANDOM_AUGMENT, "N_samples": NUM_VAL_EXAMPLES},
+    config={
+        "augment": RANDOM_AUGMENT,
+        "N_samples": NUM_VAL_EXAMPLES,
+        "normalize": True,
+    },
     num_classes=NUM_CLASSES,
     skip_pixels=SKIP_PIXELS,
     dataset_dir=dataset_dir,
@@ -185,8 +167,7 @@ val_ds = dataloaders.TorchMRI3D_Dataloader(
 test_ds = dataloaders.TorchMRI3D_Dataloader(
     json_file=config_file,
     mode="test",
-    resolution=RES,
-    config={"augment": RANDOM_AUGMENT},
+    config={"augment": RANDOM_AUGMENT, "normalize": True},
     num_classes=NUM_CLASSES,
     skip_pixels=SKIP_PIXELS,
     dataset_dir=dataset_dir,
@@ -246,24 +227,23 @@ for i in range(OUTER_LOOP_ITERATIONS // len(train_dl)):
                 val_seg = val["seg"].float().cuda()
                 val_coords = val["coords"].float().cuda()
                 val_seg_integer = val["seg_integer"].float().cuda()
+                actual_res = tuple(val["resolution"][0].tolist())
 
                 render = meta_learner.render_inner_loop(
                     val_coords, val_img, inner_loop_steps=VAL_STEPS
                 )
-                segmentation_output = render["output"][
-                    "segmentation_output"
-                ].detach()  # [0].detach().reshape(RES, RES, -1).cpu().numpy()
+                segmentation_output = render["output"]["segmentation_output"].detach()
                 segmentation_output = nn.functional.softmax(segmentation_output, dim=-1)
                 segmentation_output = (
                     segmentation_output.argmax(dim=-1)
                     .detach()
-                    .reshape(VAL_RES)
+                    .reshape(actual_res)
                     .cpu()
                     .numpy()
                 )
                 img_recon = (
                     render["output"]["inr_output"][0]
-                    .reshape(VAL_RES)
+                    .reshape(actual_res)
                     .detach()
                     .cpu()
                     .numpy()
@@ -271,18 +251,10 @@ for i in range(OUTER_LOOP_ITERATIONS // len(train_dl)):
                 segmentation_output_onehot = torch.nn.functional.one_hot(
                     torch.tensor(segmentation_output), num_classes=NUM_CLASSES_AND_ONE
                 )
-                val_reshaped = val_img[0].detach().cpu().numpy().reshape(VAL_RES)
+                val_reshaped = val_img[0].detach().cpu().numpy().reshape(actual_res)
                 val_seg_reshaped = (
-                    val_seg_integer.detach().cpu().numpy().reshape(VAL_RES)
+                    val_seg_integer.detach().cpu().numpy().reshape(actual_res)
                 )
-                # for k_x in range(0, VAL_RES[-1], VAL_RES[-1]//4):
-                #     plt.figure()
-                #     plt.subplot(121)
-                #     plt.imshow(np.concatenate([img_recon[...,k_x], val_reshaped[...,k_x]], axis=1))
-                #     plt.subplot(122)
-                #     plt.imshow(np.concatenate([segmentation_output[...,k_x], val_seg_reshaped[...,k_x]],axis=1))
-                #     plt.title(f"Iteration={ix}, Val Iteration={val_ix}")
-                #     plt.show()
                 mse_val = (
                     img_recon[..., 40:80].flatten() - val_reshaped[..., 40:80].flatten()
                 )
@@ -291,7 +263,7 @@ for i in range(OUTER_LOOP_ITERATIONS // len(train_dl)):
                 val_psnr_scores.append(float(psnr))
                 dice_score = metrics.multiclass_dice_score_3d(
                     segmentation_output_onehot.cuda(),
-                    val_seg.reshape(VAL_RES[0], VAL_RES[1], VAL_RES[2], -1).cuda(),
+                    val_seg.reshape(*actual_res, -1).cuda(),
                     num_classes=NUM_CLASSES_AND_ONE,
                 )
                 val_dice_score.append(float(dice_score.item()))
@@ -305,7 +277,7 @@ for i in range(OUTER_LOOP_ITERATIONS // len(train_dl)):
                     meta_learner.get_segmentation_parameters()
                 )
                 best_idx = ix
-                print("updated dice score to ", best_val_dice_score)
+                print("\nupdated dice score to ", best_val_dice_score)
                 torch.save(
                     {
                         "inr_seg_model": inr_seg_model.state_dict(),

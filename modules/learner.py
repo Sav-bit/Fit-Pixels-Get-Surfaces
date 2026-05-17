@@ -11,7 +11,7 @@ from copy import deepcopy
 
 
 class INRMetaLearner():
-    def __init__(self, model, inner_steps, config={}, custom_loss_fn=None, outer_optimizer='adam', inner_loop_loss_fn=None):
+    def __init__(self, model, inner_steps, config={}, custom_loss_fn=None, outer_optimizer='adam', inner_loop_loss_fn=None, first_order=False):
         super(INRMetaLearner, self).__init__()
         self.model = model
         self.inner_steps = inner_steps
@@ -22,6 +22,7 @@ class INRMetaLearner():
         })
 
         self.outer_optimizer = outer_optimizer
+        self.first_order = first_order
         self.configure_optimizers()
 
         self.loss_fn = custom_loss_fn if custom_loss_fn is not None else self.loss_fn_mse
@@ -103,7 +104,7 @@ class INRMetaLearner():
             if torch.isnan(loss).any():
                 print("Loss is NaN, skipping this step")
                 break
-            grads = torch.autograd.grad(loss, params.values(), create_graph=True)
+            grads = torch.autograd.grad(loss, params.values(), create_graph=not self.first_order)
             
             # Perform Adam update
             lr = self.config.get("inner_lr", 1e-4)

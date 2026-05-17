@@ -3,7 +3,6 @@ import os
 import os.path as osp
 from copy import deepcopy
 
-import alpine
 import torch
 import torch.nn as nn
 from tqdm.autonotebook import tqdm
@@ -65,6 +64,8 @@ VAL_RES = RES = [160 // SKIP_PIXELS, 160 // SKIP_PIXELS, 200 // SKIP_PIXELS]
 
 NORMALIZE_FEATURES = False
 
+# RES = (160, 160, 200)
+# VAL_RES = RES = [160 // SKIP_PIXELS, 160 // SKIP_PIXELS, 200 // SKIP_PIXELS]
 
 nonlin = "siren"
 inr_config = {
@@ -98,14 +99,9 @@ best_inr_weights = weights_from_metalearning["best_inr_weights"]
 best_classifier_weights = weights_from_metalearning["best_classifier_weights"]
 
 
-coords_tmp = alpine.utils.coords.get_coords2d(RES[0], RES[1]).float().cuda()[None, ...]
-print(coords_tmp.shape)
-
 train_ds = dataloaders.TorchMRI3D_Dataloader(
     json_file=config_file,
     mode="train",
-    resolution=RES,
-    coords=coords_tmp,
     config={"augment": RANDOM_AUGMENT},
     num_classes=NUM_CLASSES,
     skip_pixels=SKIP_PIXELS,
@@ -114,8 +110,6 @@ train_ds = dataloaders.TorchMRI3D_Dataloader(
 val_ds = dataloaders.TorchMRI3D_Dataloader(
     json_file=config_file,
     mode="val",
-    resolution=RES,
-    coords=coords_tmp,
     config={"augment": RANDOM_AUGMENT, "N_samples": 10},
     num_classes=NUM_CLASSES,
     skip_pixels=SKIP_PIXELS,
@@ -124,8 +118,6 @@ val_ds = dataloaders.TorchMRI3D_Dataloader(
 test_ds = dataloaders.TorchMRI3D_Dataloader(
     json_file=config_file,
     mode="test",
-    resolution=RES,
-    coords=coords_tmp,
     config={"augment": RANDOM_AUGMENT},
     num_classes=NUM_CLASSES,
     skip_pixels=SKIP_PIXELS,
