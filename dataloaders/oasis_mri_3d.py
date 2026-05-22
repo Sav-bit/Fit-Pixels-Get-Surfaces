@@ -60,13 +60,13 @@ class TorchMRI3D_Dataloader(torch.utils.data.Dataset):
 
     def read_nib_volume(self, file_path: str) -> np.ndarray:
         img = nib.load(file_path)
-        return img.get_fdata()[:, 16:-16, 12:-12]
+        return img.get_fdata()
 
     def read_nib_volume_and_affine(
         self, file_path: str
     ) -> tuple[np.ndarray, np.ndarray]:
         img = nib.load(file_path)
-        return img.get_fdata()[:, 16:-16, 12:-12], img.affine
+        return img.get_fdata(), img.affine
 
     def normalize_volume(self, volume: np.ndarray) -> np.ndarray:
         if not self.config.get("normalize", False):

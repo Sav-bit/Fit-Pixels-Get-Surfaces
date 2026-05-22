@@ -12,28 +12,29 @@ import torch.nn as nn
 from modules import models
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+
+def get_coords_from_affine(h: int, w: int, d: int, affine: np.ndarray) -> torch.Tensor:
+    ii = torch.arange(h, dtype=torch.float32)
+    jj = torch.arange(w, dtype=torch.float32)
+    kk = torch.arange(d, dtype=torch.float32)
+    grid_i, grid_j, grid_k = torch.meshgrid(ii, jj, kk, indexing="ij")
+    ones = torch.ones_like(grid_i)
+    voxel_coords = torch.stack([grid_i, grid_j, grid_k, ones], dim=-1)
+    affine_t = torch.from_numpy(affine).float()
+    world_coords = voxel_coords @ affine_t.T
+    return world_coords[..., :3]
+
+
 torch.manual_seed(422)
 
 # ===== Configuration =====
-SCRIPT_DIR = osp.dirname(osp.abspath(__file__))
-weights_file = osp.join(
-    SCRIPT_DIR, "notebooks", "3d", "dumps", "weights3d_num_classes_4_IS_2.pth"
-)
-classifier_weights_file = osp.join(
-    SCRIPT_DIR,
-    "notebooks",
-    "3d",
-    "dumps",
-    "weights_3d",
-    "classifierfinal_weights_LR_5e-05_exp_gamma_3.0_INR_300it_skip_pixels_2_continue.pth",
-)
+weights_file = "/scratch/thesis-saverio/dumps/metaseg_3d_step1-normalized/weights3d_num_classes_4_IS_2.pth"
+classifier_weights_file = "/scratch/thesis-saverio/dumps/weights_3d/classifierfinal_weights_LR_5e-05_exp_gamma_3.0_INR_300it_skip_pixels_2_continue.pth"
 
 TEST_RUN_STEPS = 300
-SKIP_PIXELS = 2
 NUM_CLASSES = 4
 NUM_CLASSES_AND_ONE = NUM_CLASSES + 1
-RES = (160, 160, 200)
-VAL_RES = [160 // SKIP_PIXELS, 160 // SKIP_PIXELS, 200 // SKIP_PIXELS]
 NORMALIZE_FEATURES = False
 
 # ===== Model Setup =====
@@ -82,7 +83,7 @@ except KeyError:
 classifier_model.eval()
 
 
-def inference_on_image(image_tensor, coords_tensor):
+def inference_on_image(image_tensor, coords_tensor, subsampled_shape):
     """Run inference on a single image."""
     # Create and load INR model with meta-learned initialization
     inr_model = models.INR(**inr_config).float().cuda()
@@ -110,7 +111,7 @@ def inference_on_image(image_tensor, coords_tensor):
     with torch.no_grad():
         output = classifier_model(classifier_input)
         pred_probs = nn.functional.softmax(output.unsqueeze(0).unsqueeze(0), dim=-1)
-        predictions = pred_probs.argmax(dim=-1).reshape(VAL_RES)
+        predictions = pred_probs.argmax(dim=-1).reshape(subsampled_shape)
 
     # Clean up
     del inr_model
@@ -155,79 +156,36 @@ def main():
     affine = img_nib.affine
     original_shape = img_data.shape
 
-    print(f"  Original shape: {original_shape}")
-
-    # Apply same cropping as dataloader: [:, 16:-16, 12:-12]
-    img_data = img_data[:, 16:-16, 12:-12]
-    cropped_shape = img_data.shape
-    print(f"  After cropping: {cropped_shape}")
-
-    # Resize to model resolution if needed
-    if img_data.shape != tuple(RES):
-        print(f"  Resizing from {img_data.shape} to {tuple(RES)}")
-        from scipy import ndimage
-
-        zoom_factors = [r / s for r, s in zip(RES, img_data.shape)]
-        img_data = ndimage.zoom(img_data, zoom_factors, order=1)
+    print(f"  Shape: {original_shape}")
 
     # Normalize
     img_min, img_max = img_data.min(), img_data.max()
     if img_max > img_min:
         img_data = (img_data - img_min) / (img_max - img_min)
 
-    # Prepare tensors - subsample by skip_pixels (same as dataloader does)
-    img_data_subsampled = img_data[::SKIP_PIXELS, ::SKIP_PIXELS, ::SKIP_PIXELS]
+    # Generate affine-based world coordinates and normalize to [-1, 1] (matches dataloader)
+    h, w, d = img_data.shape
+    coords_mtx = get_coords_from_affine(h, w, d, affine)
+    flat = coords_mtx.reshape(-1, 3)
+    c_min = flat.min(dim=0).values
+    c_max = flat.max(dim=0).values
+    coords_mtx = 2.0 * (coords_mtx - c_min) / (c_max - c_min) - 1.0
 
-    # Reshape to (N, 1) for image
     img_tensor = (
-        torch.from_numpy(img_data_subsampled.reshape(-1, 1)).float().cuda()[None, ...]
+        torch.from_numpy(img_data.reshape(-1, 1)).float().cuda()[None, ...]
     )
-
-    # Generate coordinates using same method as dataloader
-    h, w, d = RES
-    xx = torch.linspace(-1, 1, h)
-    yy = torch.linspace(-1, 1, w)
-    zz = torch.linspace(-1, 1, d)
-    coords_full = torch.meshgrid(xx, yy, zz, indexing="ij")
-    coords_full = torch.stack(coords_full, dim=-1)  # shape: (h, w, d, 3)
-
-    # Subsample coordinates
-    coords_subsampled = coords_full[::SKIP_PIXELS, ::SKIP_PIXELS, ::SKIP_PIXELS, ...]
-    coords_tensor = (
-        coords_subsampled.reshape(-1, 3).float().cuda()[None, ...]
-    )  # reshape to (1, N, 3)
+    coords_tensor = coords_mtx.reshape(-1, 3).float().cuda()[None, ...]
 
     # Run inference
     print("\nRunning inference...")
-    predictions = inference_on_image(img_tensor, coords_tensor)
+    predictions = inference_on_image(img_tensor, coords_tensor, original_shape)
 
-    print(f"  Prediction shape (subsampled): {predictions.shape}")
+    print(f"  Prediction shape: {predictions.shape}")
     print(f"  Unique classes: {np.unique(predictions)}")
-
-    # Upsample predictions back to model resolution (160, 160, 200)
-    from scipy import ndimage
-
-    zoom_factors = [r / s for r, s in zip(RES, predictions.shape)]
-    predictions_upsampled = ndimage.zoom(
-        predictions, zoom_factors, order=0
-    )  # order=0 for nearest neighbor
-    print(f"  Prediction shape (model res): {predictions_upsampled.shape}")
-
-    # Resize predictions back to cropped image resolution
-    zoom_factors_to_cropped = [c / r for c, r in zip(cropped_shape, RES)]
-    predictions_cropped = ndimage.zoom(
-        predictions_upsampled, zoom_factors_to_cropped, order=0
-    )
-    print(f"  Prediction shape (cropped space): {predictions_cropped.shape}")
-
-    # Undo crop to match original input shape exactly
-    predictions_original = np.zeros(original_shape, dtype=np.uint8)
-    predictions_original[:, 16:-16, 12:-12] = predictions_cropped.astype(np.uint8)
-    print(f"  Prediction shape (original): {predictions_original.shape}")
 
     # Save output
     print(f"\nSaving to: {args.output_seg}")
-    out_nib = nib.Nifti1Image(predictions_original.astype(np.uint8), affine)
+    out_nib = nib.Nifti1Image(predictions.astype(np.uint8), affine)
     nib.save(out_nib, args.output_seg)
 
     print("=" * 80)

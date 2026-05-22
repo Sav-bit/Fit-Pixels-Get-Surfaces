@@ -142,8 +142,39 @@ val_features = extract_features(
 )
 
 
-CLASSIFIER_FINETUNE_EPOCHS = (
-    100_000  # until convergence. stop when you see acc no longer decrease.
+CLASSIFIER_FINETUNE_EPOCHS = 100_000
+EARLY_STOPPING_PATIENCE = 20  # validation checks (= PATIENCE * VAL_META_STEPS epochs)
+SUBJECT_BATCH_SIZE = 8  # subjects per gradient step; tune up if VRAM allows
+
+# Pre-stack all features into contiguous tensors for batched GPU loading.
+# All HCP subjects share the same N (fixed crop + fixed skip_pixels), so stacking is safe.
+# del the original list afterward to free the duplicated CPU memory.
+train_feat_tensor = torch.stack([d["features"].squeeze(0) for d in train_features])  # (S, N, F)
+train_seg_tensor  = torch.stack([d["seg"].squeeze(0)      for d in train_features])  # (S, N, C)
+del train_features
+val_feat_tensor = torch.stack([d["features"].squeeze(0) for d in val_features])
+val_seg_tensor  = torch.stack([d["seg"].squeeze(0)      for d in val_features])
+del val_features
+
+
+class _FeatureDataset(torch.utils.data.Dataset):
+    def __init__(self, feats, segs):
+        self.feats, self.segs = feats, segs
+
+    def __len__(self):
+        return len(self.feats)
+
+    def __getitem__(self, i):
+        return self.feats[i], self.segs[i]
+
+
+train_feat_dl = torch.utils.data.DataLoader(
+    _FeatureDataset(train_feat_tensor, train_seg_tensor),
+    batch_size=SUBJECT_BATCH_SIZE, shuffle=True, pin_memory=True, num_workers=0,
+)
+val_feat_dl = torch.utils.data.DataLoader(
+    _FeatureDataset(val_feat_tensor, val_seg_tensor),
+    batch_size=SUBJECT_BATCH_SIZE, shuffle=False, pin_memory=True, num_workers=0,
 )
 
 #### IMPORTANT: this step may have key mismatch based on how the model was saved. simply use the str.replace() function to match your saved keys to the model's named parameters
@@ -170,7 +201,7 @@ FOCAL_LOSS_GAMMA = 3.0
 ZERO_WT = 0.1
 
 EXPERIMENT_NAME = (
-    f"gamma_{FOCAL_LOSS_GAMMA}_INR_300it_skip_pixels_{SKIP_PIXELS}_continue"
+    f"gamma_{FOCAL_LOSS_GAMMA}_INR_300it_skip_pixels_{SKIP_PIXELS}_batched"
 )
 
 classifier_opt = torch.optim.Adam(classifier_model.parameters(), lr=LEARNING_RATE)
@@ -184,57 +215,63 @@ finetune_classifier_loss_fn = loss_functions.LossFunction(
     {"focal_loss": loss_functions.FocalSemanticLoss(gamma=FOCAL_LOSS_GAMMA)}
 )
 
+# torch.compile fuses elementwise ops in the small MLP — free ~10-20% speedup.
+classifier_model = torch.compile(classifier_model)
+
+scaler = torch.amp.GradScaler("cuda")
+
 final_classifier_weights = None
 best_val_score = 1e7
+epochs_without_improvement = 0
 
 pbar_epochs = tqdm(range(CLASSIFIER_FINETUNE_EPOCHS), position=0)
 for epoch in pbar_epochs:
     avg_loss_per_set = 0.0
+    classifier_model.train()
 
-    for data in train_features:
-        train_seg = data["seg"].float().cuda()                         # (1, N, C)
-        classifier_input = data["features"].float().cuda().squeeze(0)  # (N, F)
+    for feat_batch, seg_batch in train_feat_dl:
+        feat_batch = feat_batch.float().cuda(non_blocking=True)  # (B, N, F)
+        seg_batch  = seg_batch.float().cuda(non_blocking=True)   # (B, N, C)
         if NORMALIZE_FEATURES:
-            classifier_input = nn.functional.normalize(classifier_input, dim=-1)
+            feat_batch = nn.functional.normalize(feat_batch, dim=-1)
 
+        B, N, F_ = feat_batch.shape
         classifier_opt.zero_grad()
-        classifier_output = classifier_model(classifier_input)
-        classifier_output = classifier_output.unsqueeze(0)             # (1, N, C)
-        loss, loss_info = finetune_classifier_loss_fn(
-            {"output": {"segmentation_output": classifier_output}, "seg": train_seg}
-        )
-        loss.backward()
-        classifier_opt.step()
+        with torch.amp.autocast("cuda"):
+            # flatten subjects into the batch dim for the MLP, then restore
+            clf_out = classifier_model(feat_batch.view(B * N, F_)).view(B, N, -1)
+            loss, _ = finetune_classifier_loss_fn(
+                {"output": {"segmentation_output": clf_out}, "seg": seg_batch}
+            )
+        scaler.scale(loss).backward()
+        scaler.step(classifier_opt)
+        scaler.update()
         avg_loss_per_set += float(loss.item())
 
-    avg_loss_per_set /= len(train_features)
+    avg_loss_per_set /= len(train_feat_dl)
     pbar_epochs.set_description(
         f"Loss (clf): {avg_loss_per_set:.5f}. Best Val Loss(clf): {best_val_score:.5f}"
     )
     pbar_epochs.refresh()
 
     if epoch % VAL_META_STEPS == 0 and epoch > 0:
+        classifier_model.eval()
         with torch.no_grad():
             avg_val_loss = 0.0
-            for data in val_features:
-                val_seg = data["seg"].float().cuda()
-                classifier_val_input = data["features"].float().cuda().squeeze(0)  # (N, F)
+            for feat_batch, seg_batch in val_feat_dl:
+                feat_batch = feat_batch.float().cuda(non_blocking=True)
+                seg_batch  = seg_batch.float().cuda(non_blocking=True)
                 if NORMALIZE_FEATURES:
-                    classifier_val_input = nn.functional.normalize(
-                        classifier_val_input, dim=-1
+                    feat_batch = nn.functional.normalize(feat_batch, dim=-1)
+                B, N, F_ = feat_batch.shape
+                with torch.amp.autocast("cuda"):
+                    clf_out = classifier_model(feat_batch.view(B * N, F_)).view(B, N, -1)
+                    val_loss, _ = finetune_classifier_loss_fn(
+                        {"output": {"segmentation_output": clf_out}, "seg": seg_batch}
                     )
-
-                classifier_val_output = classifier_model(classifier_val_input)
-                classifier_val_output = classifier_val_output.unsqueeze(0)
-                val_loss, _ = finetune_classifier_loss_fn(
-                    {
-                        "output": {"segmentation_output": classifier_val_output},
-                        "seg": val_seg,
-                    }
-                )
                 avg_val_loss += float(val_loss.item())
 
-            avg_val_loss /= len(val_features)
+            avg_val_loss /= len(val_feat_dl)
             pbar_epochs.set_description(
                 f"Loss (clf): {avg_loss_per_set:.5f} Val Loss (clf): {avg_val_loss:.5f}"
             )
@@ -242,7 +279,10 @@ for epoch in pbar_epochs:
 
             if avg_val_loss < best_val_score:
                 best_val_score = avg_val_loss
-                final_classifier_weights = deepcopy(classifier_model.state_dict())
+                epochs_without_improvement = 0
+                # torch.compile wraps the model; unwrap for state_dict
+                raw_state = classifier_model._orig_mod.state_dict() if hasattr(classifier_model, "_orig_mod") else classifier_model.state_dict()
+                final_classifier_weights = deepcopy(raw_state)
                 tqdm.write(f"updated best val score to {best_val_score}")
                 os.makedirs(CLASSIFIER_WEIGHTS_DIR, exist_ok=True)
                 torch.save(
@@ -256,3 +296,11 @@ for epoch in pbar_epochs:
                         f"classifierfinal_weights_LR_{LEARNING_RATE}_exp_{EXPERIMENT_NAME}.pth",
                     ),
                 )
+            else:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
+                    tqdm.write(
+                        f"Early stopping at epoch {epoch}: no improvement for "
+                        f"{EARLY_STOPPING_PATIENCE * VAL_META_STEPS} epochs."
+                    )
+                    break
