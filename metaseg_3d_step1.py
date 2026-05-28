@@ -13,6 +13,7 @@ import torch.nn as nn
 from tqdm.autonotebook import tqdm
 
 import dataloaders
+import wandb
 from modules import loss_functions, metrics, models
 from modules.learner import INRMetaLearner
 
@@ -26,7 +27,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 # In[7]:
 
-OUTPUT_DIR = Path("/scratch/thesis-saverio/dumps/metaseg_3d_step1-normalized")
+OUTPUT_DIR = Path("/scratch/thesis-saverio/dumps/metaseg_3d_step1-normalized-robust")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -72,9 +73,33 @@ VAL_META_STEPS = 100
 OUTER_LOOP_ITERATIONS = 5000  # 5000
 NUM_CLASSES = 4
 NUM_CLASSES_AND_ONE = NUM_CLASSES + 1
+FIRST_ORDER = False
 
 NORMALIZE_FEATURES = False
 
+
+run = wandb.init(
+    # Set the wandb entity where your project will be logged (generally your team name).
+    entity="s240099-danmarks-tekniske-universitet-dtu",
+    # Set the wandb project where this run will be logged.
+    project="Master Thesis",
+    # Track hyperparameters and run metadata.
+    name="[STEP1] MetaSeg3D-OASIS1-unbiased-skullstripped",
+    description="MetaSeg 3D segmentation step 1: unbiased training using OASIS1 data, the same of the paper",
+    config={
+        "dataset": "OASIS1",
+        "inner_steps": INNER_STEPS,
+        "random_augment": RANDOM_AUGMENT,
+        "val_steps": VAL_STEPS,
+        "skip_pixels": SKIP_PIXELS,
+        "val_meta_steps": VAL_META_STEPS,
+        "outer_loop_iterations": OUTER_LOOP_ITERATIONS,
+        "num_classes": NUM_CLASSES,
+        "normalize_features": NORMALIZE_FEATURES,
+        "first_order": FIRST_ORDER,
+        "Directory": OUTPUT_DIR,
+    },
+)
 
 # In[12]:
 
@@ -126,7 +151,7 @@ meta_learner = INRMetaLearner(
     ),
     outer_optimizer="adam",
     inner_loop_loss_fn=None,  # uses default loss fn.
-    first_order=True,
+    first_order=FIRST_ORDER,
 )
 
 
@@ -216,6 +241,14 @@ for i in range(OUTER_LOOP_ITERATIONS // len(train_dl)):
             f"Loss: {loss.item():.5f} PSNR = {psnr.item():.5f} Dice={loss_info.get('dice_loss', -1):.4f} FL={loss_info.get('focal_loss', -1):.5f} TV={loss_info.get('tv_loss', -1):.5f}"
         )
         pbar.refresh()
+        wandb.log(
+            {
+                "train/loss": loss.item(),
+                "train/mse_loss": loss_info.get("mse_loss", 0),
+                "train/focal_loss": loss_info.get("focal_loss", 0),
+                "train/psnr": float(psnr),
+            }
+        )
 
         if ix % VAL_META_STEPS == 0:
             val_dice_score = []
@@ -255,12 +288,13 @@ for i in range(OUTER_LOOP_ITERATIONS // len(train_dl)):
                 val_seg_reshaped = (
                     val_seg_integer.detach().cpu().numpy().reshape(actual_res)
                 )
-                mse_val = (
-                    img_recon[..., 40:80].flatten() - val_reshaped[..., 40:80].flatten()
-                )
+                # PSNR (reconstruction quality)
+                mse_val = img_recon.flatten() - val_reshaped.flatten()
                 mse_val = np.mean(mse_val**2)
                 psnr = psnr = -10 * np.log10(mse_val)
                 val_psnr_scores.append(float(psnr))
+
+                # Dice (segmentation quality — used for checkpoint selection)
                 dice_score = metrics.multiclass_dice_score_3d(
                     segmentation_output_onehot.cuda(),
                     val_seg.reshape(*actual_res, -1).cuda(),
@@ -295,6 +329,14 @@ for i in range(OUTER_LOOP_ITERATIONS // len(train_dl)):
             print(
                 f"Mean Dice={np.mean(val_dice_score):.5f} +/- {np.std(val_dice_score):.5f}"
             )
+            wandb.log(
+                {
+                    "val/dice": np.mean(val_dice_score),
+                    "val/dice_std": np.std(val_dice_score),
+                    "val/psnr": np.mean(val_psnr_scores),
+                    "val/psnr_std": np.std(val_psnr_scores),
+                }
+            )
 
 
 print("Best weights from Dice=", best_val_dice_score)
@@ -314,3 +356,5 @@ torch.save(
 
 
 # In[ ]:
+
+run.finish()
