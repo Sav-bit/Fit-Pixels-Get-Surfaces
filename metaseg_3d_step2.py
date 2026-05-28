@@ -19,6 +19,17 @@ config_file = "config/HCP_split.json"
 weights_file = "/scratch/thesis-saverio/dumps/metaseg_3d_step1-normalized/weights3d_num_classes_4_IS_2.pth"
 CLASSIFIER_WEIGHTS_DIR = "/scratch/thesis-saverio/dumps/weights_3d"
 
+# --- Subject subset & disk-caching ----------------------------------------
+# Phase 1 (SAVE_FEATURE_VECS=True):  fit INR per subject, save features to disk.
+# Phase 2 (SAVE_FEATURE_VECS=False): load cached features and train classifier.
+# Re-extraction is skipped automatically if the .pth file already exists,
+# so it's safe to re-run with SAVE_FEATURE_VECS=True after a partial run.
+N_TRAIN_SUBJECTS = 200   # subset of the 657 HCP train subjects
+N_VAL_SUBJECTS = None    # None = use the full val split (82 subjects)
+SAVE_FEATURE_VECS = True  # set False after features are saved to jump to training
+SAVE_PATHS = "/scratch/thesis-saverio/dumps/intermediate_vectors"
+# --------------------------------------------------------------------------
+
 files_data = json.load(open(config_file, "r"))
 train_files = files_data["train"]
 val_files = files_data["val"]
@@ -82,31 +93,16 @@ inr_seg_model_wts = weights_from_metalearning["inr_seg_model"]
 best_inr_weights = weights_from_metalearning["best_inr_weights"]
 best_classifier_weights = weights_from_metalearning["best_classifier_weights"]
 
-train_ds = dataloaders.TorchMRI3D_Dataloader(
-    json_file=config_file,
-    mode="train",
-    config={"augment": RANDOM_AUGMENT},
-    num_classes=NUM_CLASSES,
-    skip_pixels=SKIP_PIXELS,
-    dataset_dir=dataset_dir,
-)
-val_ds = dataloaders.TorchMRI3D_Dataloader(
-    json_file=config_file,
-    mode="val",
-    config={"augment": RANDOM_AUGMENT, "N_samples": 10},
-    num_classes=NUM_CLASSES,
-    skip_pixels=SKIP_PIXELS,
-    dataset_dir=dataset_dir,
-)
-print(len(train_ds), len(val_ds))
 
-train_dl = torch.utils.data.DataLoader(train_ds, batch_size=1, shuffle=False)
-val_dl = torch.utils.data.DataLoader(val_ds, batch_size=1, shuffle=False)
+def extract_and_save_features(dl, best_inr_weights, inr_config, steps, save_dir, prefix, desc):
+    """Fit INR per subject, save penultimate features to disk. Skips existing files."""
+    os.makedirs(save_dir, exist_ok=True)
+    for idx, data in enumerate(tqdm(dl, desc=desc)):
+        save_path = osp.join(save_dir, f"{prefix}_{idx}.pth")
+        if osp.isfile(save_path):
+            tqdm.write(f"  Skipping {prefix}_{idx} (already saved)")
+            continue
 
-
-def extract_features(dl, best_inr_weights, inr_config, steps, desc):
-    features = []
-    for data in tqdm(dl, desc=desc):
         img = data["img"].float().cuda()
         seg = data["seg"].float().cuda()
         coords = data["coords"].float().cuda()
@@ -122,59 +118,80 @@ def extract_features(dl, best_inr_weights, inr_config, steps, desc):
         inr_model.fit(coords, img, epochs=steps, disable_tqdm=True)
         _, img_features = inr_model.forward_w_features(coords)
 
-        # store on CPU to free GPU memory between subjects
-        features.append(
+        torch.save(
             {
-                "seg": seg.detach().cpu(),        # (1, N, C)
-                "features": img_features[-2].detach().cpu(),  # (1, N, F)
-            }
+                "features": img_features[-2].squeeze(0).detach().cpu(),  # (N, F)
+                "seg": seg.squeeze(0).detach().cpu(),  # (N, C)
+            },
+            save_path,
         )
-    return features
+
+        del inr_model
+        torch.cuda.empty_cache()
 
 
-print("Extracting train features...")
-train_features = extract_features(
-    train_dl, best_inr_weights, inr_config, TEST_RUN_STEPS, desc="Train"
-)
-print("Extracting val features...")
-val_features = extract_features(
-    val_dl, best_inr_weights, inr_config, TEST_RUN_STEPS, desc="Val"
-)
+# ---- Phase 1: extract features and save to disk --------------------------
+if SAVE_FEATURE_VECS:
+    train_cfg = {"augment": RANDOM_AUGMENT}
+    if N_TRAIN_SUBJECTS is not None:
+        train_cfg["N_samples"] = N_TRAIN_SUBJECTS
+
+    val_cfg = {"augment": RANDOM_AUGMENT}
+    if N_VAL_SUBJECTS is not None:
+        val_cfg["N_samples"] = N_VAL_SUBJECTS
+
+    train_ds = dataloaders.TorchMRI3D_Dataloader(
+        json_file=config_file,
+        mode="train",
+        config=train_cfg,
+        num_classes=NUM_CLASSES,
+        skip_pixels=SKIP_PIXELS,
+        dataset_dir=dataset_dir,
+    )
+    val_ds = dataloaders.TorchMRI3D_Dataloader(
+        json_file=config_file,
+        mode="val",
+        config=val_cfg,
+        num_classes=NUM_CLASSES,
+        skip_pixels=SKIP_PIXELS,
+        dataset_dir=dataset_dir,
+    )
+    print(f"Subjects for extraction — train: {len(train_ds)}, val: {len(val_ds)}")
+
+    train_dl = torch.utils.data.DataLoader(train_ds, batch_size=1, shuffle=False)
+    val_dl = torch.utils.data.DataLoader(val_ds, batch_size=1, shuffle=False)
+
+    print("Extracting and saving train features...")
+    extract_and_save_features(
+        train_dl, best_inr_weights, inr_config, TEST_RUN_STEPS,
+        osp.join(SAVE_PATHS, "train"), "train", desc="Train",
+    )
+    print("Extracting and saving val features...")
+    extract_and_save_features(
+        val_dl, best_inr_weights, inr_config, TEST_RUN_STEPS,
+        osp.join(SAVE_PATHS, "val"), "val", desc="Val",
+    )
 
 
+# ---- Phase 2: train classifier from cached features ----------------------
 CLASSIFIER_FINETUNE_EPOCHS = 100_000
 EARLY_STOPPING_PATIENCE = 20  # validation checks (= PATIENCE * VAL_META_STEPS epochs)
-SUBJECT_BATCH_SIZE = 8  # subjects per gradient step; tune up if VRAM allows
-
-# Pre-stack all features into contiguous tensors for batched GPU loading.
-# All HCP subjects share the same N (fixed crop + fixed skip_pixels), so stacking is safe.
-# del the original list afterward to free the duplicated CPU memory.
-train_feat_tensor = torch.stack([d["features"].squeeze(0) for d in train_features])  # (S, N, F)
-train_seg_tensor  = torch.stack([d["seg"].squeeze(0)      for d in train_features])  # (S, N, C)
-del train_features
-val_feat_tensor = torch.stack([d["features"].squeeze(0) for d in val_features])
-val_seg_tensor  = torch.stack([d["seg"].squeeze(0)      for d in val_features])
-del val_features
-
-
-class _FeatureDataset(torch.utils.data.Dataset):
-    def __init__(self, feats, segs):
-        self.feats, self.segs = feats, segs
-
-    def __len__(self):
-        return len(self.feats)
-
-    def __getitem__(self, i):
-        return self.feats[i], self.segs[i]
-
+# batch_size=1 works for any N; increase only if all subjects share the same N
+SUBJECT_BATCH_SIZE = 1
 
 train_feat_dl = torch.utils.data.DataLoader(
-    _FeatureDataset(train_feat_tensor, train_seg_tensor),
-    batch_size=SUBJECT_BATCH_SIZE, shuffle=True, pin_memory=True, num_workers=0,
+    dataloaders.CLFFeature(SAVE_PATHS, mode="train"),
+    batch_size=SUBJECT_BATCH_SIZE,
+    shuffle=True,
+    num_workers=4,
+    pin_memory=True,
 )
 val_feat_dl = torch.utils.data.DataLoader(
-    _FeatureDataset(val_feat_tensor, val_seg_tensor),
-    batch_size=SUBJECT_BATCH_SIZE, shuffle=False, pin_memory=True, num_workers=0,
+    dataloaders.CLFFeature(SAVE_PATHS, mode="val"),
+    batch_size=SUBJECT_BATCH_SIZE,
+    shuffle=False,
+    num_workers=4,
+    pin_memory=True,
 )
 
 #### IMPORTANT: this step may have key mismatch based on how the model was saved. simply use the str.replace() function to match your saved keys to the model's named parameters
@@ -200,8 +217,9 @@ LEARNING_RATE = 5e-5
 FOCAL_LOSS_GAMMA = 3.0
 ZERO_WT = 0.1
 
+n_train_tag = N_TRAIN_SUBJECTS if N_TRAIN_SUBJECTS is not None else "all"
 EXPERIMENT_NAME = (
-    f"gamma_{FOCAL_LOSS_GAMMA}_INR_300it_skip_pixels_{SKIP_PIXELS}_batched"
+    f"gamma_{FOCAL_LOSS_GAMMA}_INR_300it_skip_pixels_{SKIP_PIXELS}_subset{n_train_tag}"
 )
 
 classifier_opt = torch.optim.Adam(classifier_model.parameters(), lr=LEARNING_RATE)
@@ -229,9 +247,9 @@ for epoch in pbar_epochs:
     avg_loss_per_set = 0.0
     classifier_model.train()
 
-    for feat_batch, seg_batch in train_feat_dl:
-        feat_batch = feat_batch.float().cuda(non_blocking=True)  # (B, N, F)
-        seg_batch  = seg_batch.float().cuda(non_blocking=True)   # (B, N, C)
+    for data_batch in train_feat_dl:
+        feat_batch = data_batch["features"].float().cuda(non_blocking=True)  # (B, N, F)
+        seg_batch = data_batch["seg"].float().cuda(non_blocking=True)  # (B, N, C)
         if NORMALIZE_FEATURES:
             feat_batch = nn.functional.normalize(feat_batch, dim=-1)
 
@@ -258,14 +276,16 @@ for epoch in pbar_epochs:
         classifier_model.eval()
         with torch.no_grad():
             avg_val_loss = 0.0
-            for feat_batch, seg_batch in val_feat_dl:
-                feat_batch = feat_batch.float().cuda(non_blocking=True)
-                seg_batch  = seg_batch.float().cuda(non_blocking=True)
+            for data_batch in val_feat_dl:
+                feat_batch = data_batch["features"].float().cuda(non_blocking=True)
+                seg_batch = data_batch["seg"].float().cuda(non_blocking=True)
                 if NORMALIZE_FEATURES:
                     feat_batch = nn.functional.normalize(feat_batch, dim=-1)
                 B, N, F_ = feat_batch.shape
                 with torch.amp.autocast("cuda"):
-                    clf_out = classifier_model(feat_batch.view(B * N, F_)).view(B, N, -1)
+                    clf_out = classifier_model(feat_batch.view(B * N, F_)).view(
+                        B, N, -1
+                    )
                     val_loss, _ = finetune_classifier_loss_fn(
                         {"output": {"segmentation_output": clf_out}, "seg": seg_batch}
                     )
@@ -281,7 +301,11 @@ for epoch in pbar_epochs:
                 best_val_score = avg_val_loss
                 epochs_without_improvement = 0
                 # torch.compile wraps the model; unwrap for state_dict
-                raw_state = classifier_model._orig_mod.state_dict() if hasattr(classifier_model, "_orig_mod") else classifier_model.state_dict()
+                raw_state = (
+                    classifier_model._orig_mod.state_dict()
+                    if hasattr(classifier_model, "_orig_mod")
+                    else classifier_model.state_dict()
+                )
                 final_classifier_weights = deepcopy(raw_state)
                 tqdm.write(f"updated best val score to {best_val_score}")
                 os.makedirs(CLASSIFIER_WEIGHTS_DIR, exist_ok=True)
