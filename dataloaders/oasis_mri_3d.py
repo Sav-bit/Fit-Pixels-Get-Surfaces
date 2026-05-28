@@ -68,14 +68,40 @@ class TorchMRI3D_Dataloader(torch.utils.data.Dataset):
         img = nib.load(file_path)
         return img.get_fdata(), img.affine
 
+    # def normalize_volume(self, volume: np.ndarray) -> np.ndarray:
+    #     if not self.config.get("normalize", False):
+    #         return volume
+    #     vmin = float(np.min(volume))
+    #     vmax = float(np.max(volume))
+    #     if vmax - vmin < 1e-8:
+    #         return volume - vmin
+    #     return (volume - vmin) / (vmax - vmin)
     def normalize_volume(self, volume: np.ndarray) -> np.ndarray:
         if not self.config.get("normalize", False):
-            return volume
-        vmin = float(np.min(volume))
-        vmax = float(np.max(volume))
-        if vmax - vmin < 1e-8:
-            return volume - vmin
-        return (volume - vmin) / (vmax - vmin)
+            return volume.astype(np.float32)
+
+        volume = volume.astype(np.float32)
+        volume = np.nan_to_num(volume, nan=0.0, posinf=0.0, neginf=0.0)
+
+        image_support_mask = volume != 0
+
+        if image_support_mask.sum() == 0:
+            return np.zeros_like(volume, dtype=np.float32)
+
+        vals = volume[image_support_mask]
+
+        low = np.percentile(vals, 0.5)
+        high = np.percentile(vals, 99.5)
+
+        if high - low < 1e-8:
+            return np.zeros_like(volume, dtype=np.float32)
+
+        volume = np.clip(volume, low, high)
+        volume = (volume - low) / (high - low)
+
+        volume[~image_support_mask] = 0.0
+
+        return volume.astype(np.float32)
 
     def get_coords(self, h: int, w: int, d: int) -> torch.Tensor:
         xx = torch.linspace(-1, 1, h)
