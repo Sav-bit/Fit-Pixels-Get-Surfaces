@@ -78,7 +78,7 @@ FIRST_ORDER = False
 NORMALIZE_FEATURES = False
 
 
-run = wandb.init(
+run: wandb.Run = wandb.init(
     # Set the wandb entity where your project will be logged (generally your team name).
     entity="s240099-danmarks-tekniske-universitet-dtu",
     # Set the wandb project where this run will be logged.
@@ -241,7 +241,7 @@ for i in range(OUTER_LOOP_ITERATIONS // len(train_dl)):
             f"Loss: {loss.item():.5f} PSNR = {psnr.item():.5f} Dice={loss_info.get('dice_loss', -1):.4f} FL={loss_info.get('focal_loss', -1):.5f} TV={loss_info.get('tv_loss', -1):.5f}"
         )
         pbar.refresh()
-        wandb.log(
+        run.log(
             {
                 "train/loss": loss.item(),
                 "train/mse_loss": loss_info.get("mse_loss", 0),
@@ -329,7 +329,7 @@ for i in range(OUTER_LOOP_ITERATIONS // len(train_dl)):
             print(
                 f"Mean Dice={np.mean(val_dice_score):.5f} +/- {np.std(val_dice_score):.5f}"
             )
-            wandb.log(
+            run.log(
                 {
                     "val/dice": np.mean(val_dice_score),
                     "val/dice_std": np.std(val_dice_score),

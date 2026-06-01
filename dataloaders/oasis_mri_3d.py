@@ -2,13 +2,13 @@ import glob
 import json
 import math
 import os.path as osp
-import time
 
 import nibabel as nib
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.utils
+from tqdm import tqdm
 
 
 class TorchMRI3D_Dataloader(torch.utils.data.Dataset):
@@ -210,24 +210,32 @@ class TorchMRI3D_Dataloader(torch.utils.data.Dataset):
 
 
 class CLFFeature(torch.utils.data.Dataset):
-    def __init__(self, path, mode):
+    def __init__(self, path, mode, preload=True):
         super(CLFFeature, self).__init__()
         self.path = path
         self.mode = mode
 
-        self.all_files = glob.glob(osp.join(self.path, self.mode, "*.pth"))
-        self.length = len(self.all_files)
+        all_files = sorted(glob.glob(osp.join(self.path, self.mode, "*.pth")))
+        self.length = len(all_files)
+
+        if preload:
+            print(f"[CLFFeature] Preloading {self.length} {mode} files into RAM...")
+            self._data = [
+                torch.load(f, weights_only=False)
+                for f in tqdm(all_files, desc=f"Loading {mode}", leave=False)
+            ]
+            self.all_files = None
+        else:
+            self._data = None
+            self.all_files = all_files
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, idx):
-        st = time.time()
-        data = torch.load(self.all_files[idx], weights_only=False)
-        et = time.time()
-        # print('time to load = ' ,et-st)
-
-        return data
+        if self._data is not None:
+            return self._data[idx]
+        return torch.load(self.all_files[idx], weights_only=False)
 
 
 # class TorchMRI3D_DataloaderFast(torch.utils.data.Dataset):

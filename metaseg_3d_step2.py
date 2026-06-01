@@ -16,7 +16,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 dataset_dir = "/scratch/thesis-saverio/data/HCP"
 config_file = "config/HCP_split.json"
 
-weights_file = "/scratch/thesis-saverio/dumps/metaseg_3d_step1-normalized/weights3d_num_classes_4_IS_2.pth"
+weights_file = "/scratch/thesis-saverio/dumps/metaseg_3d_step1-normalized-robust/weights3d_num_classes_4_IS_2.pth"
 CLASSIFIER_WEIGHTS_DIR = "/scratch/thesis-saverio/dumps/weights_3d"
 
 # --- Subject subset & disk-caching ----------------------------------------
@@ -24,8 +24,8 @@ CLASSIFIER_WEIGHTS_DIR = "/scratch/thesis-saverio/dumps/weights_3d"
 # Phase 2 (SAVE_FEATURE_VECS=False): load cached features and train classifier.
 # Re-extraction is skipped automatically if the .pth file already exists,
 # so it's safe to re-run with SAVE_FEATURE_VECS=True after a partial run.
-N_TRAIN_SUBJECTS = 200   # subset of the 657 HCP train subjects
-N_VAL_SUBJECTS = None    # None = use the full val split (82 subjects)
+N_TRAIN_SUBJECTS = 200  # subset of the 657 HCP train subjects
+N_VAL_SUBJECTS = None  # None = use the full val split (82 subjects)
 SAVE_FEATURE_VECS = True  # set False after features are saved to jump to training
 SAVE_PATHS = "/scratch/thesis-saverio/dumps/intermediate_vectors"
 # --------------------------------------------------------------------------
@@ -94,7 +94,9 @@ best_inr_weights = weights_from_metalearning["best_inr_weights"]
 best_classifier_weights = weights_from_metalearning["best_classifier_weights"]
 
 
-def extract_and_save_features(dl, best_inr_weights, inr_config, steps, save_dir, prefix, desc):
+def extract_and_save_features(
+    dl, best_inr_weights, inr_config, steps, save_dir, prefix, desc
+):
     """Fit INR per subject, save penultimate features to disk. Skips existing files."""
     os.makedirs(save_dir, exist_ok=True)
     for idx, data in enumerate(tqdm(dl, desc=desc)):
@@ -132,11 +134,11 @@ def extract_and_save_features(dl, best_inr_weights, inr_config, steps, save_dir,
 
 # ---- Phase 1: extract features and save to disk --------------------------
 if SAVE_FEATURE_VECS:
-    train_cfg = {"augment": RANDOM_AUGMENT}
+    train_cfg = {"augment": RANDOM_AUGMENT, "normalize": True}
     if N_TRAIN_SUBJECTS is not None:
         train_cfg["N_samples"] = N_TRAIN_SUBJECTS
 
-    val_cfg = {"augment": RANDOM_AUGMENT}
+    val_cfg = {"augment": RANDOM_AUGMENT, "normalize": True}
     if N_VAL_SUBJECTS is not None:
         val_cfg["N_samples"] = N_VAL_SUBJECTS
 
@@ -163,13 +165,23 @@ if SAVE_FEATURE_VECS:
 
     print("Extracting and saving train features...")
     extract_and_save_features(
-        train_dl, best_inr_weights, inr_config, TEST_RUN_STEPS,
-        osp.join(SAVE_PATHS, "train"), "train", desc="Train",
+        train_dl,
+        best_inr_weights,
+        inr_config,
+        TEST_RUN_STEPS,
+        osp.join(SAVE_PATHS, "train"),
+        "train",
+        desc="Train",
     )
     print("Extracting and saving val features...")
     extract_and_save_features(
-        val_dl, best_inr_weights, inr_config, TEST_RUN_STEPS,
-        osp.join(SAVE_PATHS, "val"), "val", desc="Val",
+        val_dl,
+        best_inr_weights,
+        inr_config,
+        TEST_RUN_STEPS,
+        osp.join(SAVE_PATHS, "val"),
+        "val",
+        desc="Val",
     )
 
 
@@ -183,14 +195,14 @@ train_feat_dl = torch.utils.data.DataLoader(
     dataloaders.CLFFeature(SAVE_PATHS, mode="train"),
     batch_size=SUBJECT_BATCH_SIZE,
     shuffle=True,
-    num_workers=4,
+    num_workers=0,
     pin_memory=True,
 )
 val_feat_dl = torch.utils.data.DataLoader(
     dataloaders.CLFFeature(SAVE_PATHS, mode="val"),
     batch_size=SUBJECT_BATCH_SIZE,
     shuffle=False,
-    num_workers=4,
+    num_workers=0,
     pin_memory=True,
 )
 
@@ -200,10 +212,8 @@ classifier_model = deepcopy(inr_seg_model.segmentation_head)
 
 classifier_weights = deepcopy(best_classifier_weights)
 try:
-    classifier_model.load_state_dict(
-        classifier_weights["final_clf_weights"]
-    )  # check key, if final_clf_weights key does not exist, then just load classifier_weights as shown above.
-except:
+    classifier_model.load_state_dict(classifier_weights["final_clf_weights"])
+except KeyError:
     classifier_weights = deepcopy(
         {
             k.replace(
@@ -212,6 +222,7 @@ except:
             for k, v in best_classifier_weights.items()
         }
     )
+    classifier_model.load_state_dict(classifier_weights)
 
 LEARNING_RATE = 5e-5
 FOCAL_LOSS_GAMMA = 3.0
