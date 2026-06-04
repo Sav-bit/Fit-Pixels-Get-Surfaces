@@ -7,6 +7,7 @@ import os
 from copy import deepcopy
 from pathlib import Path
 
+import matplotlib.cm as cm
 import numpy as np
 import torch
 import torch.nn as nn
@@ -27,12 +28,13 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 # In[7]:
 
-OUTPUT_DIR = Path("/scratch/thesis-saverio/dumps/metaseg_3d_step1-normalized-robust")
+OUTPUT_DIR = Path("/scratch/thesis-saverio/dumps/metaseg_3d_step1-oasis1-normalized")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-dataset_dir = "/scratch/thesis-saverio/data/HCP"
-config_file = "config/HCP_split.json"
+# dataset_dir = "/scratch/thesis-saverio/data/HCP"
+dataset_dir = "/projects/thesis-saverio/data/OASIS1"
+config_file = "config/oasis_splits_3d.json"
 
 
 # In[9]:
@@ -84,8 +86,8 @@ run: wandb.Run = wandb.init(
     # Set the wandb project where this run will be logged.
     project="Master Thesis",
     # Track hyperparameters and run metadata.
-    name="[STEP1] MetaSeg3D-OASIS1-unbiased-skullstripped",
-    description="MetaSeg 3D segmentation step 1: unbiased training using OASIS1 data, the same of the paper",
+    name="[STEP1] MetaSeg3D-OASIS1-normalized-skullstripped",
+    notes="MetaSeg 3D segmentation step 1: normalized training using OASIS1 data, the same of the paper",
     config={
         "dataset": "OASIS1",
         "inner_steps": INNER_STEPS,
@@ -255,6 +257,7 @@ for i in range(OUTER_LOOP_ITERATIONS // len(train_dl)):
             val_iou_scores = []
             val_psnr_scores = []
 
+            _coronal_images = None
             for val_ix, val in tqdm(enumerate(val_dl), total=len(val_dl), position=1):
                 val_img = val["img"].float().cuda()
                 val_seg = val["seg"].float().cuda()
@@ -288,6 +291,33 @@ for i in range(OUTER_LOOP_ITERATIONS // len(train_dl)):
                 val_seg_reshaped = (
                     val_seg_integer.detach().cpu().numpy().reshape(actual_res)
                 )
+
+                if val_ix == 0:
+                    _mid_y = actual_res[1] // 2
+                    _cmap = cm.get_cmap("tab10", NUM_CLASSES_AND_ONE)
+
+                    def _seg_rgb(a):
+                        return (
+                            _cmap(a.astype(float) / NUM_CLASSES)[:, :, :3] * 255
+                        ).astype(np.uint8)
+
+                    _coronal_images = {
+                        "val/recon_coronal": wandb.Image(
+                            np.clip(img_recon[:, _mid_y, :], 0, 1).T, caption="recon"
+                        ),
+                        "val/gt_coronal": wandb.Image(
+                            np.clip(val_reshaped[:, _mid_y, :], 0, 1).T,
+                            caption="GT image",
+                        ),
+                        "val/seg_pred_coronal": wandb.Image(
+                            _seg_rgb(segmentation_output[:, _mid_y, :].T),
+                            caption="pred seg",
+                        ),
+                        "val/seg_gt_coronal": wandb.Image(
+                            _seg_rgb(val_seg_reshaped[:, _mid_y, :].T), caption="GT seg"
+                        ),
+                    }
+
                 # PSNR (reconstruction quality)
                 mse_val = img_recon.flatten() - val_reshaped.flatten()
                 mse_val = np.mean(mse_val**2)
@@ -329,14 +359,15 @@ for i in range(OUTER_LOOP_ITERATIONS // len(train_dl)):
             print(
                 f"Mean Dice={np.mean(val_dice_score):.5f} +/- {np.std(val_dice_score):.5f}"
             )
-            run.log(
-                {
-                    "val/dice": np.mean(val_dice_score),
-                    "val/dice_std": np.std(val_dice_score),
-                    "val/psnr": np.mean(val_psnr_scores),
-                    "val/psnr_std": np.std(val_psnr_scores),
-                }
-            )
+            log_dict = {
+                "val/dice": np.mean(val_dice_score),
+                "val/dice_std": np.std(val_dice_score),
+                "val/psnr": np.mean(val_psnr_scores),
+                "val/psnr_std": np.std(val_psnr_scores),
+            }
+            if _coronal_images is not None:
+                log_dict.update(_coronal_images)
+            run.log(log_dict)
 
 
 print("Best weights from Dice=", best_val_dice_score)
