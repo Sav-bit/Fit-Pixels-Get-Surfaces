@@ -28,7 +28,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 # In[7]:
 
-OUTPUT_DIR = Path("/scratch/thesis-saverio/dumps/metaseg_3d_step1-oasis1-normalized")
+OUTPUT_DIR = Path("/scratch/thesis-saverio/dumps/metaseg_3d_step1-oasis1-normalized-2")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -78,6 +78,7 @@ NUM_CLASSES_AND_ONE = NUM_CLASSES + 1
 FIRST_ORDER = False
 
 NORMALIZE_FEATURES = False
+NORMALIZE_SCANS_IN_DATALOADER = False
 
 
 run: wandb.Run = wandb.init(
@@ -86,8 +87,8 @@ run: wandb.Run = wandb.init(
     # Set the wandb project where this run will be logged.
     project="Master Thesis",
     # Track hyperparameters and run metadata.
-    name="[STEP1] MetaSeg3D-OASIS1-normalized-skullstripped",
-    notes="MetaSeg 3D segmentation step 1: normalized training using OASIS1 data, the same of the paper",
+    name="[STEP1] MetaSeg3D-OASIS1-normalized-skullstripped-2",
+    notes="MetaSeg 3D segmentation step 1:  training using OASIS1 data, the data are noramlized and skullstripped, the same of the paper (this time, no normalization in the dataloader).",
     config={
         "dataset": "OASIS1",
         "inner_steps": INNER_STEPS,
@@ -100,6 +101,7 @@ run: wandb.Run = wandb.init(
         "normalize_features": NORMALIZE_FEATURES,
         "first_order": FIRST_ORDER,
         "Directory": OUTPUT_DIR,
+        "normalize_scans_in_dataloader": NORMALIZE_SCANS_IN_DATALOADER,
     },
 )
 
@@ -174,7 +176,7 @@ NUM_VAL_EXAMPLES = 100
 train_ds = dataloaders.TorchMRI3D_Dataloader(
     json_file=config_file,
     mode="train",
-    config={"augment": RANDOM_AUGMENT, "normalize": True},
+    config={"augment": RANDOM_AUGMENT, "normalize": NORMALIZE_SCANS_IN_DATALOADER},
     num_classes=NUM_CLASSES,
     skip_pixels=SKIP_PIXELS,
     dataset_dir=dataset_dir,
@@ -185,7 +187,7 @@ val_ds = dataloaders.TorchMRI3D_Dataloader(
     config={
         "augment": RANDOM_AUGMENT,
         "N_samples": NUM_VAL_EXAMPLES,
-        "normalize": True,
+        "normalize": NORMALIZE_SCANS_IN_DATALOADER,
     },
     num_classes=NUM_CLASSES,
     skip_pixels=SKIP_PIXELS,
@@ -194,7 +196,7 @@ val_ds = dataloaders.TorchMRI3D_Dataloader(
 test_ds = dataloaders.TorchMRI3D_Dataloader(
     json_file=config_file,
     mode="test",
-    config={"augment": RANDOM_AUGMENT, "normalize": True},
+    config={"augment": RANDOM_AUGMENT, "normalize": NORMALIZE_SCANS_IN_DATALOADER},
     num_classes=NUM_CLASSES,
     skip_pixels=SKIP_PIXELS,
     dataset_dir=dataset_dir,
