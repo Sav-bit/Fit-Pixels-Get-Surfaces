@@ -192,11 +192,20 @@ def main():
         default=Path("/scratch/thesis-saverio/data/HCP"),
         help="Output root"
     )
+    parser.add_argument(
+        "--num-subjects",
+        type=int,
+        default=None,
+        help="Maximum number of subjects to process (default: all)"
+    )
     args = parser.parse_args()
 
     subject_dirs = find_subject_dirs(args.src_root)
     if not subject_dirs:
         raise RuntimeError(f"No subject folders found under {args.src_root}")
+
+    if args.num_subjects is not None:
+        subject_dirs = subject_dirs[:args.num_subjects]
 
     args.dst_root.mkdir(parents=True, exist_ok=True)
 
