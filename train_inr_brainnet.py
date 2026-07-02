@@ -27,7 +27,7 @@ as an additional output alongside the vertex displacement — enabled by default
 """
 
 import copy
-import math
+import json
 import sys
 
 sys.path.insert(0, "/home/savpr/thesis/Fit-Pixels-Get-Surfaces")
@@ -56,38 +56,62 @@ from modules import models as metaseg_models
 SCRATCH_DIR = Path("/scratch/thesis-saverio/data/HCP")
 GT_DIR = Path("/projects/brainnet-data/mni152/HCP")
 META_WEIGHTS = "/scratch/thesis-saverio/dumps/metaseg_3d_step1-normalized-robust/weights3d_num_classes_4_IS_2.pth"
-DUMP_DIR = Path("/scratch/thesis-saverio/dumps/inr_brainnet_sampled_chamfer")
+DUMP_DIR = Path("/scratch/thesis-saverio/dumps/inr_brainnet_progressive")
+SPLIT_JSON = Path("config/HCP_split.json")
 
 INR_FIT_STEPS = 300
 SKIP_PIXELS = 2
-TRAIN_EPOCHS = 500
 LR = 1e-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-NUM_SUBJECTS = 100  # set to None to use all available
 
-# Loss schedule — identical to brainnet/config/topofit/events_trainer.py.
-# At epoch 201 chamfer→0 and negloglik→0.5 (we now have sigma from the graph,
-# so we can follow BrainNet's schedule exactly). Taubin stays at 40/20.
+# --- Progressive training (BrainNet 4->5->6, see CLAUDE.md) ----------------
+# Absolute/cumulative epoch numbering. Each stage continues the previous one
+# in-memory: the TopoFit model always allocates deform blocks for levels 0..6,
+# so bumping out_order just activates the next level's (until-now untrained)
+# block while keeping the trained coarse blocks. GT level rises with it.
+STAGES = [
+    {"out_order": 4, "gt_level": 4, "start": 1, "end": 200},
+    {"out_order": 5, "gt_level": 5, "start": 201, "end": 400},
+    {"out_order": 6, "gt_level": 6, "start": 401, "end": 800},
+]
+TARGET_EPOCH = 800  # full progressive run: 4->5->6 (level-5 ends 400, level-6 ends 800)
+RETURN_PIAL = False  # white-only experiment
+
+# Seed weights for the first not-yet-trained stage. If DUMP_DIR already has its
+# own checkpoints (interrupted progressive run), we resume the latest of those
+# instead and ignore RESUME_FROM.
+RESUME_FROM = Path(
+    "/scratch/thesis-saverio/dumps/inr_brainnet_white_level4/checkpoint_epoch_200.pth"
+)
+
+
+def stage_for_epoch(epoch: int) -> dict:
+    for s in STAGES:
+        if s["start"] <= epoch <= s["end"]:
+            return s
+    raise ValueError(f"epoch {epoch} not covered by STAGES")
+
+
+# Finest GT level we'll need this run — used to filter subjects up front.
+MAX_GT_LEVEL = stage_for_epoch(TARGET_EPOCH)["gt_level"]
+
+# Loss schedule — BrainNet's progressive loss transitions
+# (brainnet/config/topofit/events_trainer.py). INERT while TRAIN_EPOCHS=200
+# since epoch 201 is never reached; retained for the progressive (option 2) run.
 _LOSS_SCHEDULE: dict[int, dict] = {
     201: {
         "weights": {
             ("white", "chamfer"): 0.0,
-            ("pial", "chamfer"): 0.0,
             ("white", "negloglik"): 0.5,
-            ("pial", "negloglik"): 0.5,
             ("white", "edge_var"): 2.0,
-            ("pial", "edge_var"): 1.0,
             ("white", "tri_quality"): 1.0,
-            ("pial", "tri_quality"): 1.0,
         },
         "lr_factor": 0.5,
     },
     401: {
         "weights": {
             ("white", "edge_var"): 1.0,
-            ("pial", "edge_var"): 0.5,
             ("white", "tri_quality"): 0.5,
-            ("pial", "tri_quality"): 0.5,
         },
     },
     601: {"lr_factor": 0.5},
@@ -108,19 +132,21 @@ def _dict_sum(d: dict) -> torch.Tensor:
     return total
 
 
-def _discover_subjects(n: int | None) -> list[str]:
-    """Return sorted subject IDs that have both T1w and GT surfaces."""
-    subjects = sorted(
-        d.name
-        for d in SCRATCH_DIR.iterdir()
-        if d.is_dir()
-        and (d / "t1w.nii.gz").exists()
-        and (GT_DIR / d.name / "lh.white.resample.6.pt").exists()
-    )
-    return subjects[:n] if n is not None else subjects
+def _load_subjects(split: str) -> list[str]:
+    """Return subject IDs for a given split from SPLIT_JSON, filtering to those
+    with both a cached T1w and GT surfaces at the finest level we'll train."""
+    entries = json.loads(SPLIT_JSON.read_text())[split]
+    all_ids = [e["img"].split("/")[0] for e in entries]
+    available = [
+        s for s in all_ids
+        if (SCRATCH_DIR / s / "t1w.nii.gz").exists()
+        and (GT_DIR / s / f"lh.white.resample.{MAX_GT_LEVEL}.pt").exists()
+    ]
+    return available
 
 
-SUBJECTS = _discover_subjects(NUM_SUBJECTS)
+SUBJECTS = _load_subjects("train")
+VAL_SUBJECTS = _load_subjects("val")
 
 INR_CONFIG = {
     "in_features": 3,
@@ -237,23 +263,25 @@ def load_subject_inr(
     return inr, inr_transform
 
 
-def load_gt_surfaces(subject: str, topology: dict) -> dict[str, dict[str, Surface]]:
-    """GT surfaces as {surf_type: {hemi: Surface}} at subdivision level 6."""
+def load_gt_surfaces(
+    subject: str, topology: dict, gt_level: int
+) -> dict[str, dict[str, Surface]]:
+    """GT white surfaces as {surf_type: {hemi: Surface}} at subdivision gt_level."""
     gt_dir = GT_DIR / subject
-    gt: dict[str, dict[str, Surface]] = {}
-    for surf_type in ("white", "pial"):
-        gt[surf_type] = {}
-        for hemi in ("lh", "rh"):
-            verts = torch.load(
-                gt_dir / f"{hemi}.{surf_type}.resample.6.pt", map_location=DEVICE
-            )
-            gt[surf_type][hemi] = Surface(verts.unsqueeze(0), topology[hemi])
+    gt: dict[str, dict[str, Surface]] = {"white": {}}
+    for hemi in ("lh", "rh"):
+        verts = torch.load(
+            gt_dir / f"{hemi}.white.resample.{gt_level}.pt", map_location=DEVICE
+        )
+        gt["white"][hemi] = Surface(verts.unsqueeze(0), topology[hemi])
     return gt
 
 
 def build_criterion() -> Criterion:
-    """BrainNet Criterion with original loss weights; sphere.reg disabled (no GT)."""
+    """BrainNet Criterion; white only (pial/thickness/sphere.reg disabled)."""
     head_weights = copy.deepcopy(_brainnet_loss_config.head_weights)
+    head_weights["pial"] = 0.0
+    head_weights["thickness"] = 0.0
     head_weights["sphere.reg"] = 0.0
     config = LossParameters(
         _brainnet_loss_config.functions,
@@ -311,20 +339,19 @@ def compute_surface_loss(
         for name, val in losses.items():
             log_vals[f"{head}/{name}"] = val.item()
 
-    # Chamfer in mm (RMSE) — only present when weight > 0 (epochs 0-200)
-    if "chamfer" in loss_dict.get("white", {}):
-        log_vals["white/chamfer_mm"] = math.sqrt(loss_dict["white"]["chamfer"].item())
-    if "chamfer" in loss_dict.get("pial", {}):
-        log_vals["pial/chamfer_mm"] = math.sqrt(loss_dict["pial"]["chamfer"].item())
-
     return total, log_vals
 
 
-def build_graph_model() -> graph_module.TopoFit:
+def build_graph_model(out_order: int) -> graph_module.TopoFit:
     """Graph-only TopoFit with a single 256-dim INR feature map at every level.
 
+    All deform blocks for levels 0..max_order are allocated regardless of
+    out_order, so a checkpoint trained at a lower out_order loads cleanly into a
+    model built at a higher one (same state_dict keys) — that's what makes the
+    progressive 4->5->6 resume work.
+
     return_uncertainty=True (default): graph outputs sigma alongside vertex
-    displacements, enabling NegLogLik loss at epoch 201+.
+    displacements, enabling NegLogLik loss at level 5+.
     return_registration=False: no sphere.reg prediction (no GT available).
     """
     return graph_module.TopoFit(
@@ -332,7 +359,7 @@ def build_graph_model() -> graph_module.TopoFit:
         white_feature_maps=[["inr"]] * 7,
         pial_feature_maps=["inr"],
         in_order=0,
-        out_order=6,
+        out_order=out_order,
         max_order=6,
         white_channels={"encoder": [96, 96, 96, 96], "decoder": [96, 96, 96]},
         pial_channels=[32],
@@ -366,74 +393,117 @@ def main() -> None:
     torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
-    # Phase 2: train graph module
+    # Phase 2: train graph module (progressive 4->5->6)
     # ------------------------------------------------------------------
     print("\n" + "=" * 60)
     print("Phase 2: training graph module")
     print("=" * 60)
 
-    model = build_graph_model()
+    # --- Resume logic ---------------------------------------------------
+    # Prefer our own progressive checkpoints (interrupted run); otherwise seed
+    # from RESUME_FROM (a previous stage's final checkpoint, e.g. level-4).
+    own_ckpts = sorted(DUMP_DIR.glob("checkpoint_epoch_*.pth"))
+    if own_ckpts:
+        seed_ckpt = torch.load(own_ckpts[-1], map_location=DEVICE)
+        start_epoch = seed_ckpt["epoch"] + 1
+        resuming_own = True
+        print(f"Resuming progressive run from {own_ckpts[-1].name} → epoch {start_epoch}")
+    elif RESUME_FROM is not None and RESUME_FROM.exists():
+        seed_ckpt = torch.load(RESUME_FROM, map_location=DEVICE)
+        start_epoch = seed_ckpt["epoch"] + 1
+        resuming_own = False
+        print(f"Seeding from {RESUME_FROM.name} (epoch {seed_ckpt['epoch']}) → epoch {start_epoch}")
+    else:
+        seed_ckpt = None
+        start_epoch = 1
+        resuming_own = False
+        print("Starting fresh from epoch 1")
+
+    if start_epoch > TARGET_EPOCH:
+        print(f"Nothing to do: start epoch {start_epoch} > TARGET_EPOCH {TARGET_EPOCH}.")
+        return
+
+    stage = stage_for_epoch(start_epoch)
+    cur_out_order = stage["out_order"]
+    cur_gt_level = stage["gt_level"]
+
+    model = build_graph_model(cur_out_order)
+    if seed_ckpt is not None:
+        model.load_state_dict(seed_ckpt["model_state"])
     criterion = build_criterion()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)  # BrainNet uses AdamW
+    if resuming_own and "optimizer_state" in seed_ckpt:
+        optimizer.load_state_dict(seed_ckpt["optimizer_state"])
+
+    # Replay loss-weight changes for events strictly before start_epoch so the
+    # criterion has the right weights on resume. LR is handled separately: own
+    # resume restores it via optimizer_state; a fresh-stage seed gets it from
+    # apply_schedule() firing at start_epoch in the loop below.
+    for e in sorted(_LOSS_SCHEDULE):
+        if e < start_epoch and "weights" in _LOSS_SCHEDULE[e]:
+            criterion.update_loss_weights(_LOSS_SCHEDULE[e]["weights"])
 
     template_surfaces = load_deepsurfer_template(model.in_order, "white")
     template = {h: s.vertices.to(DEVICE) for h, s in template_surfaces.items()}
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Device: {DEVICE}")
-    print(f"Subjects: {SUBJECTS}")
-    print(f"Epochs: {TRAIN_EPOCHS}, LR: {LR}")
+    print(f"Train subjects: {len(SUBJECTS)}  Val subjects: {len(VAL_SUBJECTS)}")
+    print(f"Epochs: {start_epoch}..{TARGET_EPOCH}  (start out_order={cur_out_order}, gt_level={cur_gt_level})")
     print(f"Graph params: {n_params:,}\n")
 
     run = wandb.init(
         entity="s240099-danmarks-tekniske-universitet-dtu",
         project="Master Thesis [INR-BrainNet]",
-        name="Graph training — Sampled Chamfer + NegLogLik + Taubin 40/20",
+        name=f"Progressive white — epochs {start_epoch}-{TARGET_EPOCH} (level {cur_out_order}+)",
         notes=(
-            "BrainNet original losses: sampled chamfer (100k pts + CUDA NN) for "
-            "epochs 0-200, then negloglik (using sigma from graph deform output) "
-            "from epoch 201. Taubin restored to BrainNet original weights (40/20). "
-            "Sphere.reg disabled (no GT). return_uncertainty=True (default)."
+            "White-only progressive TopoFit (BrainNet 4->5->6 schedule). "
+            "Resumes prior stage's weights; chamfer at level 4, negloglik from 201; "
+            "Taubin 40, edge_var/tri_quality per schedule. AdamW lr 1e-4 (halved at "
+            "201/601). return_registration=False."
         ),
         config={
-            "num_subjects": len(SUBJECTS),
-            "num_epochs": TRAIN_EPOCHS,
-            "subjects": SUBJECTS,
+            "num_train_subjects": len(SUBJECTS),
+            "num_val_subjects": len(VAL_SUBJECTS),
+            "start_epoch": start_epoch,
+            "target_epoch": TARGET_EPOCH,
+            "stages": STAGES,
+            "split_json": str(SPLIT_JSON),
             "inr_fit_steps": INR_FIT_STEPS,
             "skip_pixels": SKIP_PIXELS,
             "lr": LR,
             "inr_feat_dim": INR_FEAT_DIM,
             "graph_params": n_params,
             "device": DEVICE,
-            "loss_weights_white": _brainnet_loss_config.loss_weights["white"],
-            "loss_weights_pial": _brainnet_loss_config.loss_weights["pial"],
-            "head_weights": {
-                k: v
-                for k, v in _brainnet_loss_config.head_weights.items()
-                if k != "sphere.reg"
-            },
         },
     )
 
-    step = 0
-    for epoch in range(1, TRAIN_EPOCHS + 1):
+    step = (start_epoch - 1) * len(SUBJECTS)
+    for epoch in range(start_epoch, TARGET_EPOCH + 1):
+        st = stage_for_epoch(epoch)
+        if st["out_order"] != cur_out_order:
+            model.set_out_order(st["out_order"])
+            print(f"  [stage] epoch {epoch:03d}: out_order {cur_out_order}->{st['out_order']}, "
+                  f"gt_level {cur_gt_level}->{st['gt_level']}")
+            cur_out_order = st["out_order"]
+            cur_gt_level = st["gt_level"]
+
         if apply_schedule(epoch, criterion, optimizer):
-            current_lr = optimizer.param_groups[0]["lr"]
-            print(f"  [schedule] epoch {epoch:03d}: lr={current_lr:.2e}")
+            print(f"  [schedule] epoch {epoch:03d}: lr={optimizer.param_groups[0]['lr']:.2e}")
 
         epoch_loss = 0.0
         model.train()
 
         for subj in SUBJECTS:
             inr, inr_transform = load_subject_inr(subj)
-            gt = load_gt_surfaces(subj, model.out_topology)
+            gt = load_gt_surfaces(subj, model.out_topology, cur_gt_level)
 
             optimizer.zero_grad()
 
             out = model(
                 features=None,
                 template=template,
-                return_pial=True,
+                return_pial=RETURN_PIAL,
                 inr_model=inr,
                 inr_transform=inr_transform,
             )
@@ -463,7 +533,7 @@ def main() -> None:
 
         avg = epoch_loss / len(SUBJECTS)
         current_lr = optimizer.param_groups[0]["lr"]
-        print(f"  -- epoch {epoch:03d} avg loss: {avg:.4f}")
+        print(f"  -- epoch {epoch:03d} avg loss: {avg:.4f}  (level {cur_out_order})")
         wandb.log(
             {"train/epoch_avg_loss": avg, "train/lr": current_lr, "epoch": epoch},
             step=step,
@@ -475,6 +545,13 @@ def main() -> None:
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "avg_loss": avg,
+                "config": {
+                    "out_order": cur_out_order,
+                    "gt_level": cur_gt_level,
+                    "return_pial": RETURN_PIAL,
+                    "return_registration": False,
+                    "inr_feat_dim": INR_FEAT_DIM,
+                },
             },
             DUMP_DIR / f"checkpoint_epoch_{epoch:03d}.pth",
         )
