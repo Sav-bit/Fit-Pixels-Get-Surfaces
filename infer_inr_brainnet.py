@@ -47,6 +47,16 @@ META_WEIGHTS = (
 )
 DUMP_DIR = Path("/scratch/thesis-saverio/dumps/inr_brainnet_white_level4")
 
+# Opt-in --dataset shortcut (mirrors validate_inr_brainnet.py). When --dataset
+# <DS> is given, paths are overridden to <DATA_ROOT>/<DS> (INR cache, writable)
+# and the T1w is read straight from <GT_ROOT>/<DS>/<subj>/T1w.nii (GT_ROOT is
+# read-only). GT surfaces also come from <GT_ROOT>/<DS>. Without --dataset the
+# HCP defaults above are unchanged.
+DATA_ROOT = Path("/scratch/thesis-saverio/data")
+GT_ROOT = Path("/projects/brainnet-data/mni152")
+T1W_DIR = SCRATCH_DIR
+T1W_NAME = "t1w.nii.gz"
+
 INR_FIT_STEPS = 300
 SKIP_PIXELS = 2
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -94,9 +104,9 @@ def fit_and_save_inr(subject: str, meta_weights: dict) -> None:
         print(f"  [{subject}] INR cached, skipping fit")
         return
 
-    t1w_path = SCRATCH_DIR / subject / "t1w.nii.gz"
+    t1w_path = T1W_DIR / subject / T1W_NAME
     if not t1w_path.exists():
-        print(f"  [{subject}] t1w.nii.gz not found", file=sys.stderr)
+        print(f"  [{subject}] {T1W_NAME} not found", file=sys.stderr)
         sys.exit(1)
 
     img_nib = nib.load(t1w_path)
@@ -126,6 +136,7 @@ def fit_and_save_inr(subject: str, meta_weights: dict) -> None:
     print(f"  [{subject}] fitting INR ({INR_FIT_STEPS} steps)...")
     inr.fit(coords_t, img_t, epochs=INR_FIT_STEPS, disable_tqdm=False)
 
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {"inr_weights": inr.state_dict(), "c_min": c_min, "c_max": c_max}, out_path
     )
@@ -235,10 +246,17 @@ def parse_args():
     p = argparse.ArgumentParser(description="INR-BrainNet single-subject inference.")
     p.add_argument("subject", help="Subject ID, e.g. sub-105")
     p.add_argument(
+        "--dataset", default=None,
+        help="Infer on another dataset: T1w from <GT_ROOT>/<DS>/<subj>/T1w.nii, "
+        "GT + INR cache under <DS>. Omit for HCP.",
+    )
+    p.add_argument(
         "--epoch", type=int, default=None, help="Checkpoint epoch (default: latest)"
     )
     p.add_argument(
-        "--dump-dir", type=Path, default=DUMP_DIR,
+        "--dump-dir",
+        type=Path,
+        default=DUMP_DIR,
         help=f"Experiment dir with checkpoints (default: {DUMP_DIR})",
     )
     p.add_argument("--out-dir", type=Path, default=None, help="Output directory")
@@ -249,6 +267,14 @@ def main():
     args = parse_args()
     subject = args.subject
     dump_dir = args.dump_dir
+
+    # --dataset: override the HCP path globals (mirrors validate_inr_brainnet.py).
+    if args.dataset is not None:
+        global SCRATCH_DIR, GT_DIR, T1W_DIR, T1W_NAME
+        SCRATCH_DIR = DATA_ROOT / args.dataset  # INR cache (writable)
+        GT_DIR = GT_ROOT / args.dataset
+        T1W_DIR, T1W_NAME = GT_DIR, "T1w.nii"  # read T1w straight from /projects
+        print(f"Dataset  : {args.dataset}")
 
     if args.epoch is not None:
         ckpt_path = dump_dir / f"checkpoint_epoch_{args.epoch:03d}.pth"
@@ -265,7 +291,8 @@ def main():
 
     epoch_num = int(ckpt_path.stem.split("_")[-1])
 
-    out_dir = args.out_dir or Path(f"inspection/{subject}_epoch{epoch_num:03d}")
+    tag = f"{args.dataset}_" if args.dataset else ""
+    out_dir = args.out_dir or Path(f"inspection/{tag}{subject}_epoch{epoch_num:03d}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Subject  : {subject}")
@@ -286,9 +313,13 @@ def main():
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
-    surf_types: tuple[str, ...] = ("white", "pial") if config["return_pial"] else ("white",)
-    print(f"Config   : out_order={config['out_order']} "
-          f"gt_level={config['gt_level']} surfaces={surf_types}")
+    surf_types: tuple[str, ...] = (
+        ("white", "pial") if config["return_pial"] else ("white",)
+    )
+    print(
+        f"Config   : out_order={config['out_order']} "
+        f"gt_level={config['gt_level']} surfaces={surf_types}"
+    )
 
     template_surfaces = load_deepsurfer_template(model.in_order, "white")
     template = {h: s.vertices.to(DEVICE) for h, s in template_surfaces.items()}
@@ -316,9 +347,13 @@ def main():
             _write_surf(p_gt, gt[surf_type][hemi])
             saved.extend([p_pred, p_gt])
 
-    t1w_path = SCRATCH_DIR / subject / "t1w.nii.gz"
-    print("\nDone. Open in NiiVue (VS Code): click a file below, then 'Open With… → NiiVue',")
-    print("or drag several onto an open NiiVue tab. Predicted = .pred, ground truth = .gt.\n")
+    t1w_path = T1W_DIR / subject / T1W_NAME
+    print(
+        "\nDone. Open in NiiVue (VS Code): click a file below, then 'Open With… → NiiVue',"
+    )
+    print(
+        "or drag several onto an open NiiVue tab. Predicted = .pred, ground truth = .gt.\n"
+    )
     print(f"  {t1w_path.resolve()}   (background volume)")
     for p in saved:
         print(f"  {p.resolve()}")
